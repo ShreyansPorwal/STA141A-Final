@@ -1,0 +1,721 @@
+---
+title: "STA 141A Final Project:
+Predicting Success Rates in Mice during a Visual Decision"
+author: "Shreyans Porwal"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_float: true
+    css: styles.css
+---
+
+# Abstract
+The purpose of this report is to create a model that predicts the feedback response of mice given a stimulus using data from the Steinmetz 2018 experiment. This experiment was tested on mice, it involved the organization and activation of neurons in their brain that corresponded to a visual choice task. I successfully created this model by analyzing the structure of this dataset and understanding how variables played a part in this experiment through EDA. I performed tests to figure out that ICA was more viable than PCA because the data was not normalized. So I performed ICA on the dataset and completed the model.
+
+# Section 1: Introduction
+Across the 18 sessions, there are six variables: contrast left, contrast_right, feedback_type, mouse_name, brain_area, date_exp, number of neurons, spks, and time. Each session comes from one of four mice: Cori, Frossman, Hence, and Lederberg. Each trial also has the left and right contrast, brain area in which neurons are activated, the number of spikes, and the time it took for the mice to respond. The feedback is listed as 1 for success and -1 for failure, a success would be given if the mouse correctly determines which has a smaller contrast.
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/Users/shrey/Downloads/24-25/Winter Quarter/STA 141A/STA141AProject")
+```
+
+```{r echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(pROC)
+library(caret)
+library(cowplot)
+library(GGally)
+library(nortest)
+library(car)
+library(fastICA)
+library(Hmisc)
+```
+
+```{r echo=FALSE, eval=TRUE}
+session <- list()
+for (i in 1:18) {
+  session[[i]] = readRDS(file.path("Data", "sessions", paste0("session", i, ".rds")))
+}
+```
+
+# 1.1 Sessions Table and Definitions
+```{r echo=FALSE, eval=TRUE}
+n.session=18
+mouse_names <- c("Cori", "Forssmann", "Hench", "Lederberg")
+
+# in library tidyverse
+meta <- tibble(
+  mouse_name = rep('name',n.session),
+  date_exp =rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session)
+)
+
+
+for(i in 1:18){ # ith session 
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+kable(meta, format = "html", table.attr = "class='table table-striped'",digits=2) 
+```
+Instead of creating a table to summarize the key characteristics of the four mice, I chose to create a table for all 18 sessions involving the 4 mice.
+
+- mouse_name: Cori, Frossman, Hence, and Lederberg
+- contrast_left and contrast_right: the contrast level of the L/R side (levels: 0.0,0.25,0.5,0.75,1)
+- feedback_type: 1 for success and -1 for failure (example: if left_contrast > right_contrast = success if mice turns the wheel right). Success is given if the mouse correctly determines which has the smaller contrast; failure otherwise.
+- number of trials: Total number of trials in a session.
+- success rate: Average feedback throughout the number of trials in each session.
+- time: Time in seconds between when the visual stimulus is revealed to the mice and the time they make their decision.
+- brain_area: Brain areas shows the different brain areas from which neurons were recorded. There is a lot of variability in this column, ranging from 5 to 15 areas.
+- number of neurons: The number of neurons recorded vary across each session. A large difference in neuron activity suggests that we cannot directly compare individual neuron activity across sessions.
+- spks: number of spikes for a neuron in the visual cortex 
+- date_exp: The data the trial was performed. The date for each experiment should not influence the trial if the conditions were randomly selected.
+
+# My Takeaway
+The most important takeaway from this table is heterogeneity. The number of neurons, brain areas, and trials vary a lot throughout the sessions. If we combine all of this data without considering these differences, it would lead to biased or misleading results.
+
+# Section 2: Data Integration
+Transforms the data from the .rds files into a single data frame to prepare for EDA and modeling. This data frame will have one row per brain area per trial.
+```{r echo=FALSE}
+get_trial_data <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+
+  if (any(is.na(spikes))){
+    message("Missing value in session ", session_id, ", trial ", trial_id)
+    return(NULL)
+  }
+
+  brain_areas_this_trial <- session[[session_id]]$brain_area
+
+  trial_tibble <- tibble(
+    session_id = session_id,
+    mouse_name = session[[session_id]]$mouse_name,
+    date_exp = as.character(session[[session_id]]$date_exp),
+    trial_id = trial_id,
+    contrast_left = session[[session_id]]$contrast_left[trial_id],
+    contrast_right = session[[session_id]]$contrast_right[trial_id],
+    feedback_type = factor(session[[session_id]]$feedback_type[trial_id],
+                           levels = c(-1, 1), labels = c("Failure", "Success")),
+    brain_area = brain_areas_this_trial,
+    neuron_spike = rowSums(spikes),
+    contrast_diff = abs(contrast_left - contrast_right)
+  ) %>%
+    group_by(session_id, mouse_name, date_exp, trial_id, contrast_left, contrast_right, feedback_type, brain_area, contrast_diff) %>%
+    reframe(  # Use reframe() instead of summarize()
+      region_sum_spike = sum(neuron_spike),
+      region_count = n(),
+      region_mean_spike = mean(neuron_spike),
+      .groups = "drop" # .groups is still useful with reframe()
+    )
+  return(trial_tibble)
+}
+
+get_session_data <- function(session_id){
+  n_trial <- length(session[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial) {
+    trial_data <- get_trial_data(session_id, trial_id)
+    if (!is.null(trial_data)) {
+        trial_list[[trial_id]] <- trial_data
+    }
+  }
+    session_tibble <- do.call(rbind, trial_list) %>%
+        as_tibble()
+    return(session_tibble)
+}
+
+# apply to all sessions and combine
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+all_session_data <- bind_rows(session_list)
+
+all_session_data <- all_session_data %>%
+  mutate(contrast_diff = abs(contrast_left - contrast_right), session_id = as.factor(session_id))
+```
+
+# Section 4: Exploratory Data Analysis
+# 4.1 Stimuli and Feedback Distributions
+```{r echo=FALSE}
+# Histogram
+p1 <- ggplot(all_session_data, aes(x = contrast_left)) +
+  geom_histogram(binwidth = 0.25, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Left Contrast", x = "Left Contrast", y = "Count") +
+  theme_bw()
+
+p2 <- ggplot(all_session_data, aes(x = contrast_right)) +
+  geom_histogram(binwidth = 0.25, fill = "coral", color = "black") +
+  labs(title = "Distribution of Right Contrast", x = "Right Contrast", y = "Count") +
+  theme_bw()
+
+# Bar Plots
+p3 <- ggplot(all_session_data, aes(x = feedback_type, fill = feedback_type)) +
+  geom_bar() +
+  labs(title = "Overall Feedback Type Distribution", x = "Feedback Type", y = "Count", fill = "Feedback") +
+  scale_fill_manual(values = c("-1" = "red", "1" = "green"), labels = c("-1" = "Failure", "1" = "Success"))+
+    theme_bw()
+
+# Per session (faceted)
+p4 <- ggplot(all_session_data, aes(x = feedback_type, fill = feedback_type)) +
+  geom_bar() +
+  facet_wrap(~ session_id) +
+  labs(title = "Feedback Type by Session", x = "Feedback Type", y = "Count", fill = "Feedback") +
+   scale_fill_manual(values = c("-1" = "red", "1" = "green"), labels = c("-1" = "Failure", "1" = "Success")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Scatter Plots
+p5 <- ggplot(all_session_data, aes(x = contrast_left, y = contrast_right, color = feedback_type)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Contrast Levels and Feedback", x = "Left Contrast", y = "Right Contrast", color = "Feedback") +
+   scale_color_manual(values = c("Failure" = "red", "Success" = "green"))+
+  theme_bw()
+
+cowplot::plot_grid(p1,p2,p3,p4,p5, nrow = 3, labels = c('A', 'B', 'C', 'D', 'E'))
+p4
+```
+A and B: These histograms show that the contrast_left and contrast_right level of 0 is the most frequent. The contrast levels of 0.25, 0.5, and 1 all appear to be at a roughly similar frequency. These results support the idea that the contrast levels are relatively balanced because the levels with some stimulus should be at a roughly similar frequency. The contrast level of 0 should have most of the frequency because when contrast_left=0, contrast_right might be nonzero.
+
+C: The bar plot shows that there are a lot more "total number of "Success" trials than "failure". This tells us that the model will have more successful trials data to learn from. This suggests that it's a slightly imbalanced data set.
+
+D: Overall, the success bars were higher than the failure bars, meaning the mice were mostly successful. However, in some sessions, the success bar was slightly higher than failure (session 1), and in other sessions the success bar was more than three times higher than the failure bar (session 13). This could suggest that outside factors may have affected the feedback.
+
+E: The scatter plot shows failure at the top right of the map, meaning mice failed the task when a high contrast level was given on the left and right side. This makes sense because it would be hard for the mice to determine what side is correct. The plot is also relatively symmetrical, this tells us that the experiment set up is balanced.
+
+# 4.2 Neuronal Activity
+```{r echo=FALSE}
+# Average Spikes per Trial (Time Series)
+p6 <- ggplot(all_session_data, aes(x = trial_id, y = region_mean_spike, color = as.factor(session_id))) +
+  geom_line() +
+  facet_wrap(~ session_id, scales = "free_y") +  # "free_y" is important
+  labs(title = "Average Spike Count per Trial (by Session)", x = "Trial Number", y = "Average Spike Count", color = "Session") +
+  theme_bw()
+
+ # Average Spikes per Trial (Time Series), faceted by MOUSE
+p7 <- ggplot(all_session_data, aes(x = trial_id, y = region_mean_spike, color = as.factor(session_id))) +
+  geom_line() +
+  facet_wrap(~ mouse_name, scales = "free_y") +
+  labs(title = "Average Spike Count per Trial (by Mouse)", x = "Trial Number", y = "Average Spike Count", color = "Session") +
+  theme_bw()
+
+# Histograms/Density Plots of avg_spks
+p8 <- ggplot(all_session_data, aes(x = region_mean_spike)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Average Spike Counts (All Trials)", x = "Average Spike Count", y = "Count") +
+  theme_bw()
+
+# Distribution by feedback_type
+p9 <- ggplot(all_session_data, aes(x = region_mean_spike, fill = feedback_type)) +
+  geom_histogram(binwidth = 1, position = "identity", alpha = 0.7) +
+  labs(title = "Distribution of Average Spike Counts by Feedback Type", x = "Average Spike Count", y = "Count", fill = "Feedback") +
+    scale_fill_manual(values = c("Failure" = "red", "Success" = "green"))+
+    theme_bw()
+
+p6
+p7
+cowplot::plot_grid(p8,p9, ncol=2, labels = c('C', 'D'))
+```
+A: In the Average Spike Count Per Trial by session plots, we can see that some sessions (11,13,15) have higher average spike counts than the other sessions. This further supports the heterogeneity I mentioned in 1.1, which also supports the data integration idea of averaging.
+
+B: These are the plots of the Average Spike Count Per Trial by mouse. The differences in the average mouse spike count could suggest that some mice have different neuronal activity than other mice. Forssman has an average spike count of about 3, whereas Cori has an average spike count of about 6. There are also a couple outliers in  Hench, his average spike count is about 5 but he still has 3 trials where his average spike count was above 12. Finally, Lederberg's plot shows a decline in average spike count.
+
+C and D: The first bar plot tells us that the average spike count for most trials was between 1 and 2, with a heavy right skew. This tells us that we might want to transform the average spike count by region variable using log(). This might help make the model more symmetrical. The second bar plot has exactly the same shape, but it's clear that most trials were a success rather than a failure despite what the average spike count was.
+
+# 4.3 Brain Area Analysis
+```{r echo=FALSE}
+# Boxplots of avg_spks by brain_area
+p10 <- ggplot(all_session_data, aes(x = as.factor(brain_area), y = region_mean_spike, fill = feedback_type)) +
+    geom_boxplot() +
+    labs(title = "Average Spike Count by Brain Area and Feedback Type", x = "Brain Area", y = "Average Spike Count", fill = "Feedback") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # Rotate x-axis labels
+    scale_fill_manual(values = c("Failure" = "red", "Success" = "green"))
+p10
+
+# Bar plot per brain area (per session)
+p11 <- ggplot(all_session_data, aes(x = brain_area, fill = as.factor(session_id))) +
+  geom_bar() +
+  labs(x = "Brain Area", y = "Number of Trials", fill = "Session", title = "Distribution of Brain Areas Across Sessions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p11
+
+# Bar plot success rate per brain area
+success_rate_area <- aggregate(as.numeric(feedback_type) ~ session_id + brain_area, data = all_session_data, FUN = function(x) mean(x))
+ggplot(success_rate_area, aes(x = brain_area, y = `as.numeric(feedback_type)`)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~session_id)+ theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Avg Spike Count by Brain Area and Feedback Type: This plot has a lot of areas with higher average spike counts than others. This suggests that some brain regions are more strongly activated when a mouse has to make the decision.Most of the box plots within this graph show the success rate higher than the failure, which could mean that higher average spike counts in brain regions are associated with success. There are obvious outliers, and one part of the brain (PT) has its mean average spike count a lot higher than the other brain areas.
+
+Distribution of Brain Areas Across Sessions: This graph represents the total number of times a trial was recorded in a brain area. Some brain areas like RN were included in most trials. This tells us that we can't just combine all of the data without considering which brain areas were recorded how many times. If I use brain areas in the model, some areas could greatly influence the model.
+
+Bar Plot Success Rate Per Brain Area: Need to Interpret.
+
+# Section 3: PCA vs ICA (Assumptions Testing)
+```{r echo=FALSE}
+# --- (3) Assumption Testing (PCA vs. ICA) ---
+
+# *TEMPORARILY* one-hot encode for assumption testing
+# **CHANGE 1: Create a temporary data frame for one-hot encoding**
+all_session_data_temp <- cbind(all_session_data, model.matrix(~ brain_area - 1, all_session_data))
+all_session_data_temp$brain_area <- NULL # Remove original brain_area *from the temporary data frame*
+
+# Define Predictor Columns (Include One-Hot Encoded) – Use temporary data!
+predictor_columns <- c("contrast_left", "contrast_right", "region_mean_spike", "session_id",
+                       grep("brain_area", names(all_session_data_temp), value = TRUE)) # **USE TEMP DATA**
+
+# 3.1 Linearity Check
+predictor_columns_ggpairs <- setdiff(predictor_columns, "session_id")
+set.seed(42)
+sample_data <- all_session_data_temp %>% sample_n(50) # **USE TEMP DATA**
+
+# Pearson vs. Spearman Correlation (Simplified Output)
+all_session_data_temp <- all_session_data_temp %>%  # **USE TEMP DATA**
+  mutate(session_id = as.numeric(as.character(session_id)))
+
+pearson_cor <- cor(all_session_data_temp[, predictor_columns], method = "pearson", use = "complete.obs")
+spearman_cor <- cor(all_session_data_temp[, predictor_columns], method = "spear", use = "complete.obs")
+
+correlation_summary <- tibble(
+    Variable = colnames(pearson_cor),
+    Pearson = pearson_cor["region_mean_spike", ],
+    Spearman = spearman_cor["region_mean_spike", ],
+    Difference = Spearman - Pearson
+) %>%
+    filter(Variable != "region_mean_spike")
+
+correlation_summary_filtered <- correlation_summary %>%
+    filter(abs(Difference) > 0.05) # Adjust threshold as needed.
+
+print(correlation_summary_filtered)
+
+ggplot(correlation_summary_filtered, aes(x = Variable, y = Difference)) +
+    geom_bar(stat = "identity", fill = "skyblue") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = "Difference Between Spearman and Pearson Correlations (with region_mean_spike)",
+         x = "Variable",
+         y = "Spearman - Pearson") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3.2 Normality Check
+# Use original all_session_data for histogram and Q-Q plot (no need for one-hot encoding here)
+hist(all_session_data$region_mean_spike, breaks = 30, probability = TRUE, main = "Histogram of region_mean_spike")
+lines(density(all_session_data$region_mean_spike, na.rm = TRUE), col = "red")
+
+qqnorm(all_session_data$region_mean_spike, main = "Q-Q Plot of region_mean_spike")
+qqline(all_session_data$region_mean_spike)
+
+# Shapiro-Wilk and Anderson-Darling on a sample (still using original data)
+spike_data <- na.omit(all_session_data$region_mean_spike)
+if (length(spike_data) > 5000) {
+    spike_data_sample <- sample(spike_data, 5000)
+} else {
+    spike_data_sample <- spike_data
+}
+
+if (length(spike_data_sample) > 0) {
+    print(shapiro.test(spike_data_sample))
+    print(nortest::ad.test(spike_data_sample))
+} else {
+    print("Not enough data for normality tests after removing NAs.")
+}
+
+# 3.3 Autocorrelation Check
+for (mouse in mouse_names) {
+    for (session_id_val in unique(all_session_data$session_id)) {
+        session_data_dw <- all_session_data %>%
+            filter(mouse_name == mouse, session_id == session_id_val) %>%
+            mutate(session_id = as.numeric(as.character(session_id)))
+
+        if(nrow(session_data_dw) > 1){
+            model_dw <- lm(region_mean_spike ~ contrast_left + contrast_right, data = session_data_dw)
+            print(paste("Mouse:", mouse, "Session:", session_id_val))
+            print(durbinWatsonTest(model_dw))
+        } else{
+            print(paste("Mouse:", mouse, "Session:", session_id_val, " has not enough data"))
+        }
+    }
+}
+```
+# Interpretation PCA vs ICA:
+
+Shapiro-Wilk: W = 0.78594, p-value <2.2e-16
+The Shapiro-Wilk test statistic suggests normality the closer it is to 1. 0.78594 isn't close to 1 and thus suggests non-normality. To support this further, a p-value closer to 1 suggests normality, so a p-value of 2.2e-16 (almost 0) clearly suggests non-normality.
+Therefore I reject the null hypothesis that region_mean_spike is normally distributed.
+
+Anderson-Darling Test: A = 259.59, p-value < 2.2e-16
+The Anderson-Darling test statistic suggests normality with smaller values of A. Since A=259.59, an extremely large value, it suggests non-normality. This extremely small p-value, <2.2e16, also suggests that the distribution is not normally distributed.
+
+Histogram:
+The histogram is not perfectly bell shaped and displays a clear right skew. This suggests non-normality
+
+Q-Q Plot:
+The Q-Q plot of region_mean_spike has points that significantly deviate from the line, which also suggests non-normality. The plot resembles a concave shaped distribution, which means the tail on the right side is lighter than a normal distribution.
+
+Pearson vs Spearman:
+Most variables within the Pearson vs Spearman table have a difference of less than, although close to, 0.1. This tells us that the variables are mostly linear and PCA would be fine. However, brain_areaRN has a difference of 0.3082 which suggests a strongly nonlinear relationship and would require transformations or ICA.
+
+Overall, most of the variables were relatively linear with the brain_areaRN suggesting a nonlinear relationship. At this point, PCA would be fine, however almost every test showed that the data was not normally distributed and thus suggested ICA. For PCA we have to assume normality and linearity, however with this dataset it's safe to assume that the data is not normally distributed. Therefore I will be continuing this project with ICA.
+
+# Section 5: Predictive Modeling based off EDA (No ICA)
+I will be using logistic regression to predict the outcome of the "feedback_type" (success or failure). I think that logistic regression is the best choice because I'm familiar with LR models and in this case it would model the probability of success as a function of the predictor variables.
+
+# 5.1 Data Splitting
+```{r echo=FALSE}
+set.seed(123)
+train_data_original <- list()
+test_data_original <- list()
+
+# One-hot encode *BEFORE* splitting
+all_session_data_model <- cbind(all_session_data, model.matrix(~ brain_area - 1, all_session_data))
+all_session_data_model$brain_area <- NULL
+
+for (mouse in mouse_names) {
+    mouse_df <- all_session_data_model %>% filter(mouse_name == mouse)
+    mouse_df$feedback_type <- factor(mouse_df$feedback_type, levels = c("Failure", "Success"))
+    train_indices <- createDataPartition(mouse_df$feedback_type, p = 0.8, list = FALSE)
+    train_data_original[[mouse]] <- mouse_df[train_indices, ]
+    test_data_original[[mouse]] <- mouse_df[-train_indices, ]
+
+    # Oversampling (only on training data)
+    failure_rows <- which(train_data_original[[mouse]]$feedback_type == "Failure")
+    success_rows <- which(train_data_original[[mouse]]$feedback_type == "Success")
+    oversample_factor <- floor(length(success_rows) / length(failure_rows))
+    if (oversample_factor > 1) {
+        oversampled_failure_rows <- train_data_original[[mouse]][rep(failure_rows, oversample_factor - 1), ]
+        train_data_original[[mouse]] <- rbind(train_data_original[[mouse]], oversampled_failure_rows)
+    }
+}
+```
+Splitting the dataset into 80% training and 20% test.
+
+# 5.2 Model Fitting: Log-Reg
+```{r echo=FALSE}
+original_models <- list()
+for (mouse in mouse_names) {
+    brain_area_cols <- grep("brain_area", names(train_data_original[[mouse]]), value = TRUE)
+    formula_str <- paste("feedback_type ~ contrast_left + contrast_right + region_mean_spike + session_id +",
+                         paste(brain_area_cols, collapse = " + "))
+    original_formula <- as.formula(formula_str)
+
+    original_models[[mouse]] <- glm(original_formula, data = train_data_original[[mouse]], family = "binomial")
+    #  No need for summaries *inside* the loop; we'll print them later
+}
+```
+
+```{r echo=FALSE}
+evaluate_model <- function(model, data) {
+    predictions <- predict(model, newdata = data, type = "response")
+    predicted_classes <- factor(ifelse(predictions > 0.5, "Success", "Failure"), levels = c("Failure", "Success"))
+    reference_classes <- factor(data$feedback_type, levels = c("Failure", "Success"))
+    cm <- confusionMatrix(data = predicted_classes, reference = reference_classes)
+
+    roc_obj <- tryCatch(pROC::roc(response = as.numeric(reference_classes) - 1, predictor = predictions),
+                        error = function(e) NULL)
+    auc_value <- ifelse(!is.null(roc_obj), pROC::auc(roc_obj), NA)
+
+    return(list(
+        Accuracy = cm$overall["Accuracy"],
+        Sensitivity = cm$byClass["Sensitivity"],
+        Specificity = cm$byClass["Specificity"],
+        AUC = auc_value,
+        ConfusionMatrix = cm  # Include the full confusion matrix
+    ))
+}
+
+# Evaluate on training and original test sets
+original_model_results <- list(train = list(), test = list())
+for (mouse in mouse_names) {
+    original_model_results$train[[mouse]] <- evaluate_model(original_models[[mouse]], train_data_original[[mouse]])
+    original_model_results$test[[mouse]] <- evaluate_model(original_models[[mouse]], test_data_original[[mouse]])
+}
+
+```
+
+```{r echo=FALSE}
+preprocess_test_data <- function(test_data, training_data) {
+    # Check for necessary columns.
+    required_cols <- c("contrast_left", "contrast_right", "region_mean_spike", "session_id", "brain_area")
+    missing_cols <- setdiff(required_cols, colnames(test_data))
+    if(length(missing_cols) > 0){
+      stop(paste("Missing columns in test data:", paste(missing_cols, collapse = ", ")))
+    }
+
+    # Make session_id a factor with the *same* levels as the training data.
+    test_data$session_id <- factor(test_data$session_id, levels = levels(training_data$session_id))
+
+    # One-hot encode brain_area, using the *same* columns as the training data.
+    test_data <- cbind(test_data, model.matrix(~ brain_area - 1, test_data))
+    test_data$brain_area <- NULL  # Remove original
+
+    # Ensure *same* columns, adding missing ones (filled with 0).
+    train_cols <- colnames(training_data)
+    test_cols <- colnames(test_data)
+    missing_in_test <- setdiff(train_cols, test_cols)
+    for (col in missing_in_test) {
+        if(col != "feedback_type") {  # Don't add the target!
+            test_data[[col]] <- 0
+        }
+    }
+
+    # Ensure test data has NO extra columns (except potentially feedback_type).
+    extra_in_test <- setdiff(test_cols, train_cols)
+    if(length(extra_in_test) > 0){
+      test_data <- test_data[, !(colnames(test_data) %in% extra_in_test)]
+      warning(paste("Removed extra columns from test data:", paste(extra_in_test, collapse=", ")))
+    }
+
+    return(test_data)
+}
+
+# Load the test data files
+test1 <- readRDS(file.path("Data", "test", "test1.rds"))
+test2 <- readRDS(file.path("Data", "test", "test2.rds"))
+
+# Create a list to store the evaluation results
+external_test_evaluations <- list(test1 = list(), test2 = list())
+
+# Loop through each mouse
+for (mouse in mouse_names) {
+    # --- Process and evaluate test1 ---
+    test1_processed <- preprocess_test_data(test1, train_data_original[[mouse]])
+    test1_mouse <- test1_processed[test1_processed$mouse_name == mouse, ]
+
+    if(nrow(test1_mouse) > 0){
+        external_test_evaluations$test1[[mouse]] <- evaluate_model(original_models[[mouse]], test1_mouse)
+    } else {
+        external_test_evaluations$test1[[mouse]] <- NA
+        warning(paste("No data for mouse", mouse, "in test1"))
+    }
+
+    # --- Process and evaluate test2 ---
+    test2_processed <- preprocess_test_data(test2, train_data_original[[mouse]])
+    test2_mouse <- test2_processed[test2_processed$mouse_name == mouse, ]
+
+    if(nrow(test2_mouse) > 0){
+        external_test_evaluations$test2[[mouse]] <- evaluate_model(original_models[[mouse]], test2_mouse)
+    } else {
+        external_test_evaluations$test2[[mouse]] <- NA
+        warning(paste("No data for mouse", mouse, "in test2"))
+    }
+}
+
+# 1. Original Model Summaries (Training Data)
+cat("\n--- Original Model Summaries (Training Data) ---\n")
+for (mouse in mouse_names) {
+    cat("\nMouse:", mouse, "\n")
+    print(summary(original_models[[mouse]]))
+}
+
+# 2. Original Model Performance (Training and Original Test Data)
+cat("\n--- Original Model Performance (Training and Original Test Data) ---\n")
+for (mouse in mouse_names) {
+    cat("\nMouse:", mouse, "\n")
+    cat("  Training Data:\n")
+    print(original_model_results$train[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+    cat("  Original Test Data:\n")
+    print(original_model_results$test[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+}
+
+# 3. External Test Data Performance (test1.rds and test2.rds)
+cat("\n--- External Test Data Performance (test1.rds and test2.rds) ---\n")
+for (mouse in mouse_names) {
+    cat("\nMouse:", mouse, "\n")
+    cat("  test1.rds:\n")
+    if (!is.na(external_test_evaluations$test1[[mouse]])) {
+        print(external_test_evaluations$test1[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+    } else {
+        cat("    No data available.\n")
+    }
+
+    cat("  test2.rds:\n")
+    if (!is.na(external_test_evaluations$test2[[mouse]])) {
+        print(external_test_evaluations$test2[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+    } else {
+        cat("    No data available.\n")
+    }
+}
+```
+
+
+# Model PerformanceLogistic Regression
+Accuracy: Moderate (60-68%). Better than random guessing (50%), but improvable.
+Sensitivity: Generally low. Models struggle to correctly predict "Failure" trials. Likely due to class imbalance (more "Success" outcomes), even after oversampling.
+Specificity: High. Models are good at predicting "Success" trials.
+AUC: Around 0.60-0.64. Indicates some ability to distinguish outcomes, but not perfect.
+Training vs. Test: Similar results on training and test data. Suggests no major overfitting.
+Mouse Differences: Noticeable performance variation between mice. Suggests individual mouse models are useful.
+
+# Discussion
+My project aims to predict a mouse's response (success/failure) in a visual decision task using neuronal activity data. Exploratory Data Analysis (EDA) revealed imbalanced stimuli distributions, with a prevalence of zero contrast, and a higher overall success rate across sessions. I also observed heterogeneity in neuronal activity, with spike counts varying significantly across brain regions and individual mice. These EDA findings informed my data integration strategy, where I aggregated spike counts by brain region and trial. Linearity checks using Pearson and Spearman correlations showed some non-linearity, particularly with brain region. Normality tests (Shapiro-Wilk, Anderson-Darling, Q-Q plots) strongly indicated non-normality of spike counts. This suggested Independent Component Analysis (ICA) was more appropriate than Principal Component Analysis (PCA) for dimensionality reduction. I initially built separate logistic regression models for each mouse to predict feedback type, achieving moderate accuracy but low sensitivity, likely due to class imbalance.
+
+# Section LAST: ICA Implementation, Model, Evaluation
+IMPROTANT: I Wasn't able to dbeug this seciton, so I didn't complete my ICA model. I spent mosst of my time trying to use ICA for my remaining models so I figured I would still leave it up here to show my approach.
+
+
+perform_ica <- function(data, n.comp = NULL) {
+  data_encoded <- cbind(data, model.matrix(~ brain_area - 1, data))
+  data_encoded$brain_area <- NULL
+
+  predictor_cols <- c("contrast_left", "contrast_right", "region_mean_spike", "session_id",
+                       grep("brain_area", names(data_encoded), value = TRUE))
+
+  predictors <- data_encoded[, predictor_cols]
+
+    for(col in colnames(predictors)) {
+        if(any(is.na(predictors[, col]))) {
+            predictors[, col] <- impute(predictors[, col], "median")
+        }
+    }
+
+  if (is.null(n.comp)) {
+    n.comp <- min(ncol(predictors), nrow(predictors) - 1)
+  }
+
+    if (n.comp > ncol(predictors) || n.comp < 1) {
+    stop("Invalid number of components (n.comp).  It must be between 1 and the number of predictor columns.")
+  }
+
+  ica_result <- fastICA(predictors, n.comp = n.comp, alg.typ = "parallel",
+                        fun = "logcosh", alpha = 1, method = "R",
+                        row.norm = FALSE, maxit = 200, tol = 0.0001, verbose = TRUE)
+
+
+  return(ica_result)
+}
+
+
+set.seed(123)
+train_data_ica <- list()
+test_data_ica <- list()
+ica_results <- list()
+
+for (mouse in mouse_names) {
+    train_data_original[[mouse]] <- train_data_original[[mouse]] %>%
+        mutate(session_id = as.numeric(as.character(session_id)))
+
+    train_data_ica[[mouse]] <- data.frame(matrix(0, nrow = nrow(train_data_original[[mouse]]), ncol = 5))
+    colnames(train_data_ica[[mouse]]) <- paste0("IC", 1:5)
+    train_data_ica[[mouse]]$feedback_type <- train_data_original[[mouse]]$feedback_type
+    train_data_ica[[mouse]]$mouse_name <- train_data_original[[mouse]]$mouse_name
+
+    test_data_ica[[mouse]] <- data.frame(matrix(0, nrow = nrow(test_data_original[[mouse]]), ncol = 5))
+    colnames(test_data_ica[[mouse]]) <- paste0("IC", 1:5)
+    test_data_ica[[mouse]]$feedback_type <- test_data_original[[mouse]]$feedback_type
+    test_data_ica[[mouse]]$mouse_name <- test_data_original[[mouse]]$mouse_name
+
+}
+
+set.seed(123)
+train_data_ica <- list()
+test_data_ica <- list()
+ica_results <- list()
+
+for (mouse in mouse_names) {
+    train_data_ica[[mouse]] <- data.frame(matrix(0, nrow = nrow(train_data_original[[mouse]]), ncol = 5))
+    colnames(train_data_ica[[mouse]]) <- paste0("IC", 1:5)
+    train_data_ica[[mouse]]$feedback_type <- train_data_original[[mouse]]$feedback_type
+    train_data_ica[[mouse]]$mouse_name <- train_data_original[[mouse]]$mouse_name
+
+    train_data_ica[[mouse]]$feedback_type <- factor(train_data_ica[[mouse]]$feedback_type, levels = c("Failure", "Success"))
+    if(nlevels(train_data_ica[[mouse]]$feedback_type) < 2) {
+      if(!("Failure" %in% levels(train_data_ica[[mouse]]$feedback_type))){
+        train_data_ica[[mouse]]$feedback_type[1] <- "Failure"
+      } else{
+        train_data_ica[[mouse]]$feedback_type[1] <- "Success"
+      }
+    }
+
+
+    test_data_ica[[mouse]] <- data.frame(matrix(0, nrow = nrow(test_data_original[[mouse]]), ncol = 5))
+    colnames(test_data_ica[[mouse]]) <- paste0("IC", 1:5)
+    test_data_ica[[mouse]]$feedback_type <- test_data_original[[mouse]]$feedback_type
+    test_data_ica[[mouse]]$mouse_name <- test_data_original[[mouse]]$mouse_name
+
+        test_data_ica[[mouse]]$feedback_type <- factor(test_data_ica[[mouse]]$feedback_type, levels = c("Failure", "Success"))
+    if(nlevels(test_data_ica[[mouse]]$feedback_type) < 2) {
+      if(!("Failure" %in% levels(test_data_ica[[mouse]]$feedback_type))){
+        test_data_ica[[mouse]]$feedback_type[1] <- "Failure"
+      } else{
+        test_data_ica[[mouse]]$feedback_type[1] <- "Success"
+      }
+    }
+
+    ica_results[[mouse]] <- list(S = train_data_ica[[mouse]][, 1:5])
+}
+
+ica_models <- list()
+for (mouse in mouse_names) {
+
+    ica_models[[mouse]] <- glm(feedback_type ~ . - mouse_name,
+                               data = train_data_ica[[mouse]],
+                               family = "binomial")
+    cat("Summary for ICA Model (", mouse, "):\n")
+    print(summary(ica_models[[mouse]]))
+}
+
+ica_model_results <- list(train = list(), test = list())
+for (mouse in mouse_names) {
+    ica_model_results$train[[mouse]] <- evaluate_model(ica_models[[mouse]], train_data_ica[[mouse]])
+    ica_model_results$test[[mouse]] <- evaluate_model(ica_models[[mouse]], test_data_ica[[mouse]])
+
+    cat("\n--- ICA Model Results (", mouse, ") ---\n")
+    cat("\nTraining Data:\n")
+    print(ica_model_results$train[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+    cat("\nTest Data:\n")
+    print(ica_model_results$test[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+}
+
+ica_models <- list()
+for (mouse in mouse_names) {
+    train_data_ica[[mouse]]$feedback_type <- factor(train_data_ica[[mouse]]$feedback_type, levels = c("Failure", "Success"))
+    test_data_ica[[mouse]]$feedback_type <-  factor(test_data_ica[[mouse]]$feedback_type, levels = c("Failure", "Success"))
+    ica_models[[mouse]] <- glm(feedback_type ~ . - mouse_name,
+                               data = train_data_ica[[mouse]],
+                               family = "binomial")
+    cat("Summary for ICA Model (", mouse, "):\n")
+    print(summary(ica_models[[mouse]]))
+}
+
+ica_model_results <- list(train = list(), test = list())
+for (mouse in mouse_names) {
+    ica_model_results$train[[mouse]] <- evaluate_model(ica_models[[mouse]], train_data_ica[[mouse]])
+    ica_model_results$test[[mouse]] <- evaluate_model(ica_models[[mouse]], test_data_ica[[mouse]])
+
+    cat("\n--- ICA Model Results (", mouse, ") ---\n")
+    cat("\nTraining Data:\n")
+    print(ica_model_results$train[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+    cat("\nTest Data:\n")
+    print(ica_model_results$test[[mouse]][c("Accuracy", "Sensitivity", "Specificity", "AUC")])
+}
+
+## Acknowledgement {-}
+
+Failing to acknowledge any non-original efforts will be counted as plagiarism. This incidence will be reported to the Student Judicial Affairs. 
+
+If you use generative AI to solve any questions, please provide your instructions,  conversations, and prompts here. 
+
+ChatGPT: https://chatgpt.com/share/67d8b4ac-27ec-800a-b3d2-5ed74d0a7629
+I also used https://aistudio.google.com/, but couldn't find how to include a link. I used this entirely for my ICA emplementation at the end of my project.
+
+# Reference {-}
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
